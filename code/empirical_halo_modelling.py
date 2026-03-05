@@ -1,21 +1,3 @@
-# %%
-import numpy as np
-from numba import njit
-import matplotlib.pyplot as plt
-
-# %%
-from utils import load_and_format_sharks_gals
-
-# %%
-gals, groups = load_and_format_sharks_gals('/Users/sp624AA/Downloads/mocks/v0.4.0/waves_deep_gals.parquet')
-
-# %%
-groups.columns
-
-# %%
-groups[['log_fof_halo_mass', 'zobs_bcg', 'is_red_bcg', 'is_blue_bcg', 'n_sat_red', 'n_sat_blue']][0:10]
-
-# %%
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -419,6 +401,46 @@ def compute_mass_bin_moments_observed_space(
     return centres, out
 
 
+def rebuild_group_colour_occupancy_from_gals(
+    groups: pd.DataFrame,
+    gals: pd.DataFrame,
+    group_id_col: str = "id_fof",
+    gal_red_col: str = "is_red",
+    gal_bcg_col: str = "is_bcg",
+) -> pd.DataFrame:
+    """
+    Rebuild group-level colour occupancy directly from galaxy rows.
+
+    This avoids relying on precomputed group colour columns that may be
+    misaligned after index operations.
+    """
+    needed = {group_id_col, gal_red_col, gal_bcg_col}
+    missing = [c for c in needed if c not in gals.columns]
+    if missing:
+        raise ValueError(f"Cannot rebuild group occupancy; missing galaxy columns: {missing}")
+    if group_id_col not in groups.columns:
+        raise ValueError(f"Cannot rebuild group occupancy; groups missing '{group_id_col}'.")
+
+    g = groups.copy()
+    d = gals[[group_id_col, gal_red_col, gal_bcg_col]].copy()
+    d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=[group_id_col])
+    d[gal_red_col] = d[gal_red_col].astype(bool)
+    d[gal_bcg_col] = d[gal_bcg_col].astype(bool)
+
+    sats = d.loc[~d[gal_bcg_col]]
+    sat_red = sats.loc[sats[gal_red_col]].groupby(group_id_col).size()
+    sat_blue = sats.loc[~sats[gal_red_col]].groupby(group_id_col).size()
+
+    bcg = d.loc[d[gal_bcg_col]].sort_values(group_id_col).groupby(group_id_col, as_index=True)[gal_red_col].first()
+
+    gid = g[group_id_col]
+    g["n_sat_red"] = gid.map(sat_red).fillna(0).astype(int)
+    g["n_sat_blue"] = gid.map(sat_blue).fillna(0).astype(int)
+    g["is_red_bcg"] = gid.map(bcg).fillna(False).astype(bool)
+    g["is_blue_bcg"] = ~g["is_red_bcg"]
+    return g
+
+
 def compute_r200_c_per_mass_bin_from_groups(
     groups: pd.DataFrame,
     mass_col: str,
@@ -471,8 +493,9 @@ def predict_xi_1h_binned_observed_space(
     moments_by_bin: Dict[int, MassBinMoments],
     r200_by_bin: Dict[int, float],
     c_by_bin: Dict[int, float],
-    nbar_red: float,
-    nbar_blue: float,
+    pair_density_rr: float,
+    pair_density_bb: float,
+    pair_density_rb: float,
     rng: np.random.Generator,
     n_cs: int = 200_000,
     n_ss: int = 200_000,
@@ -480,20 +503,23 @@ def predict_xi_1h_binned_observed_space(
     """
     Predict the 1-halo 3D 2PCF:
 
-        xi(r) = DD(r) / [ n_bar_A * n_bar_B * shell_vol(r) / f_pair ] - 1
+        xi(r) = DD(r) / [ I2_AB * shell_vol(r) / f_pair ] - 1
 
     where DD(r) is the halo-abundance-weighted mean number of 1-halo pairs
-    per radial bin (from NFW Monte Carlo), and n_bar_A, n_bar_B are the
-    pair-weighted effective mean number densities from the skew-Gaussian
-    n(z) fit.
+    per radial bin (from NFW Monte Carlo), and
+
+        I2_AB = integral n_A(z) * n_B(z) * dV/dz dz
+
+    is the selection-aware pair-density integral from the fitted n(z) curves.
 
     For auto-correlations f_pair = 2 (unordered pairs);
     for cross-correlations f_pair = 1.
 
     Parameters
     ----------
-    nbar_red  : pair-weighted mean density of red  galaxies [(Mpc/h)^{-3}]
-    nbar_blue : pair-weighted mean density of blue galaxies [(Mpc/h)^{-3}]
+    pair_density_rr : integral n_red(z)^2            dV/dz dz  [(Mpc/h)^-3]
+    pair_density_bb : integral n_blue(z)^2           dV/dz dz  [(Mpc/h)^-3]
+    pair_density_rb : integral n_red(z)*n_blue(z)    dV/dz dz  [(Mpc/h)^-3]
     """
     r         = 0.5 * (r_bins[:-1] + r_bins[1:])
     dr        = np.diff(r_bins)
@@ -518,11 +544,11 @@ def predict_xi_1h_binned_observed_space(
         DD_rb += mom.n_halo * (mom.cs_rb * pbin_cs + mom.ss_rb * pbin_ss)
 
     # xi(r) = DD(r) / expected_random_pairs(r) - 1
-    # expected_random_pairs(r) = n_bar_A * n_bar_B * shell_vol / f_pair
+    # expected_random_pairs(r) = I2_AB * shell_vol / f_pair
     # f_pair = 2 for auto (unordered), 1 for cross
-    denom_rr = nbar_red  ** 2        * shell_vol / 2.0
-    denom_bb = nbar_blue ** 2        * shell_vol / 2.0
-    denom_rb = nbar_red  * nbar_blue * shell_vol        # cross: no 1/2
+    denom_rr = pair_density_rr * shell_vol / 2.0
+    denom_bb = pair_density_bb * shell_vol / 2.0
+    denom_rb = pair_density_rb * shell_vol        # cross: no 1/2
 
     return {
         "r":     r,
@@ -530,6 +556,41 @@ def predict_xi_1h_binned_observed_space(
         "xi_bb": DD_bb / np.maximum(denom_bb, 1e-300) - 1.0,
         "xi_rb": DD_rb / np.maximum(denom_rb, 1e-300) - 1.0,
     }
+
+
+def compute_pair_density_integrals(
+    n_of_z_red: Callable,
+    n_of_z_blue: Callable,
+    z_values: np.ndarray,
+    sky_fraction: float,
+    omega_matter: float,
+    z_cutoff: float,
+) -> tuple[float, float, float]:
+    """Compute selection-aware pair integrals I2_AB = integral n_A(z)n_B(z)dV/dz dz."""
+    cosmo = FlatLambdaCDM(H0=100.0, Om0=omega_matter)
+    z = z_values[np.isfinite(z_values) & (z_values >= 0.0) & (z_values < z_cutoff)]
+    if z.size == 0:
+        raise ValueError("No galaxies available to estimate pair-density integrals.")
+
+    z_min = float(np.min(z))
+    z_max = float(z_cutoff)
+    def dVdz(zz):
+        return (
+            cosmo.differential_comoving_volume(np.asarray(zz, dtype=float)).value
+            * 4.0
+            * np.pi
+            * sky_fraction
+        )
+
+    i2_rr, _ = quad(lambda zz: float(n_of_z_red(zz)) ** 2 * dVdz(zz), z_min, z_max, limit=200)
+    i2_bb, _ = quad(lambda zz: float(n_of_z_blue(zz)) ** 2 * dVdz(zz), z_min, z_max, limit=200)
+    i2_rb, _ = quad(
+        lambda zz: float(n_of_z_red(zz)) * float(n_of_z_blue(zz)) * dVdz(zz),
+        z_min,
+        z_max,
+        limit=200,
+    )
+    return float(i2_rr), float(i2_bb), float(i2_rb)
 
 
 # ============================================================
@@ -598,6 +659,9 @@ def run_from_groups_observed_space(
     # --- column names (galaxies) ---
     gal_z_col:   str = "zobs",     # redshift column in gals
     gal_red_col: str = "is_red",   # boolean/int red-galaxy flag in gals
+    gal_bcg_col: str = "is_bcg",   # boolean/int central flag in gals
+    group_id_col: str = "id_fof",  # group id in both groups and gals
+    rebuild_group_colours_from_gals: bool = True,
     # --- survey geometry ---
     sky_fraction: float = 0.0012,
     z_cutoff:     float = 0.8,
@@ -632,6 +696,8 @@ def run_from_groups_observed_space(
     groups       : group/halo catalog (one row per group)
     gals         : galaxy-level catalog — used only for the n(z) fit;
                    must contain `gal_z_col` and `gal_red_col`
+                   if `rebuild_group_colours_from_gals=True` (default),
+                   it must also contain `group_id_col` and `gal_bcg_col`
     sky_fraction : fraction of sky covered by the survey (default 0.0012)
     z_cutoff     : hard redshift upper limit of the survey (default 0.8)
 
@@ -648,10 +714,22 @@ def run_from_groups_observed_space(
         wp_rb     – cross      projected 2PCF  [Mpc/h]
         nbar_red  – effective mean density of red  galaxies [(Mpc/h)^{-3}]
         nbar_blue – effective mean density of blue galaxies [(Mpc/h)^{-3}]
+        pair_density_rr – ∫ n_red^2 dV [(Mpc/h)^{-3}] for random RR normalization
+        pair_density_bb – ∫ n_blue^2 dV [(Mpc/h)^{-3}] for random BB normalization
+        pair_density_rb – ∫ n_red n_blue dV [(Mpc/h)^{-3}] for random RB normalization
         nz_red    – callable n(z) for red  galaxies (for diagnostic plots)
         nz_blue   – callable n(z) for blue galaxies (for diagnostic plots)
     """
     rng = np.random.default_rng(seed)
+
+    if rebuild_group_colours_from_gals:
+        groups = rebuild_group_colour_occupancy_from_gals(
+            groups,
+            gals,
+            group_id_col=group_id_col,
+            gal_red_col=gal_red_col,
+            gal_bcg_col=gal_bcg_col,
+        )
 
     # Separation grids
     if r_bins is None:
@@ -682,6 +760,15 @@ def run_from_groups_observed_space(
     )
     print(f"  n_bar_blue = {nbar_blue:.4e}  (Mpc/h)^-3")
 
+    pair_density_rr, pair_density_bb, pair_density_rb = compute_pair_density_integrals(
+        nz_red,
+        nz_blue,
+        gals[gal_z_col].to_numpy(dtype=np.float64),
+        sky_fraction=sky_fraction,
+        omega_matter=omega_matter,
+        z_cutoff=z_cutoff,
+    )
+
     # ---- Halo-model moments ----
     _, moments = compute_mass_bin_moments_observed_space(
         groups, mass_col, mass_bin_edges,
@@ -702,8 +789,9 @@ def run_from_groups_observed_space(
         moments_by_bin=moments,
         r200_by_bin=r200_by_bin,
         c_by_bin=c_by_bin,
-        nbar_red=nbar_red,
-        nbar_blue=nbar_blue,
+        pair_density_rr=pair_density_rr,
+        pair_density_bb=pair_density_bb,
+        pair_density_rb=pair_density_rb,
         rng=rng,
         n_cs=n_cs,
         n_ss=n_ss,
@@ -722,77 +810,10 @@ def run_from_groups_observed_space(
         "wp_rb":     wp_rb,
         "nbar_red":  nbar_red,
         "nbar_blue": nbar_blue,
+        "pair_density_rr": pair_density_rr,
+        "pair_density_bb": pair_density_bb,
+        "pair_density_rb": pair_density_rb,
         "nz_red":    nz_red,
         "nz_blue":   nz_blue,
     })
     return pred
-
-
-
-
-# %%
-
-pred = run_from_groups_observed_space(
-    groups       = groups,
-    gals         = gals,       # needs 'zobs' and 'is_red' columns
-    omega_matter = 0.27,
-    sky_fraction = 0.0012,
-    z_cutoff     = 0.8,
-    pi_max       = 40.0,
-)
-
-z_plot = np.linspace(0.0, 0.8, 300)
-fig, ax = plt.subplots()
-ax.plot(z_plot, pred["nz_red"](z_plot),  label="red n(z)")
-ax.plot(z_plot, pred["nz_blue"](z_plot), label="blue n(z)")
-ax.set_xlabel("z");  ax.set_ylabel(r"$n(z)\;[(\mathrm{Mpc}/h)^{-3}]$")
-ax.legend();  plt.show()
-#
-# 3-D correlation function
-r, xi_rr, xi_bb, xi_rb = pred["r"], pred["xi_rr"], pred["xi_bb"], pred["xi_rb"]
-#
-# Projected correlation function
-rp, wp_rr, wp_bb, wp_rb = pred["rp"], pred["wp_rr"], pred["wp_bb"], pred["wp_rb"]
-plt.savefig("../plots/xi_1h_observed_space.png", dpi=300)
-plt.show()
-plt.clf()
-
-# %%
-plt.figure()
-plt.plot(rp, wp_rr, c = 'r', label=r"$\xi_{rr}^{1h}(r)$")
-plt.plot(rp, wp_bb, c = 'b', label=r"$\xi_{bb}^{1h}(r)$")
-plt.plot(rp, wp_rb, c='purple', label=r"$\xi_{rb}^{1h}(r)$")
-plt.xscale("log")
-plt.yscale("log")  # comment this out if xi_rr goes negative anywhere
-plt.xlabel(r"$r$ [Mpc/h]")
-plt.ylabel(r"$\xi^{1h}(r)$")
-plt.grid(True, which="both", alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.savefig("../plots/wp_1h_observed_space.png", dpi=300)
-plt.show()
-plt.clf()
-
-# %%
-plt.figure()
-plt.plot(r, xi_rr, c = 'r', label=r"$\xi_{rr}^{1h}(r)$")
-plt.plot(r, xi_bb, c = 'b', label=r"$\xi_{bb}^{1h}(r)$")
-plt.plot(r, xi_rb, c='purple', label=r"$\xi_{rb}^{1h}(r)$")
-plt.xscale("log")
-plt.yscale("log")  # comment this out if xi_rr goes negative anywhere
-plt.xlabel(r"$r$ [Mpc/h]") 
-plt.ylabel(r"$\xi^{1h}(r)$")
-plt.grid(True, which="both", alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.savefig("../plots/xi_1h_observed_space.png", dpi=300)
-plt.show()
-plt.clg()
-
-# %%
-print(max(xi_rr), max(xi_bb), max(xi_rb))
-
-# %%
-
-
-
