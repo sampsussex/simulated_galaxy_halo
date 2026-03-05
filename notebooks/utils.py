@@ -1,16 +1,20 @@
 import numpy as np
 import pandas as pd
 
-def load_and_format_sharks_gals(file_path, cols = ['ra', 'dec', 'id_galaxy_sky', 'id_group_sky', 
+def load_and_format_sharks_gals(file_path, region='deep', cols = ['ra', 'dec', 'id_galaxy_sky', 'id_group_sky', 
                                               'type', 'zcos', 'zobs', 'mstars_bulge', 'mstars_disk', 
                                               'mgas_disk', 'mgas_bulge', 'mvir_hosthalo', 'mvir_subhalo', 
                                               'id_fof', 'sfr_disk', 'sfr_burst', 'total_ab_dust_u_VST', 
                                               'total_ab_dust_g_VST', 'total_ab_dust_r_VST', 'total_ab_dust_i_VST', 
                                               'total_ab_dust_Z_VISTA', 'total_ab_dust_Y_VISTA', 'total_ab_dust_J_VISTA', 
-                                              'total_ab_dust_H_VISTA', 'total_ab_dust_K_VISTA'], bcg_on = 'Z_VISTA'):
+                                              'total_ab_dust_H_VISTA', 'total_ab_dust_K_VISTA','total_ap_dust_Z_VISTA'], bcg_on = 'Z_VISTA'):
     """
     Load and format the SHARKS galaxy catalog.
     """
+
+    if region not in ['deep', 'wide']:
+        raise ValueError("Invalid value for region. Must be 'deep' or 'wide'.")
+    
     if bcg_on not in ['Z_VISTA', 'Stellar Mass']:
         raise ValueError("Invalid value for bcg_on. Must be 'Z_VISTA' or 'Stellar Mass'.")
     
@@ -124,7 +128,7 @@ def load_and_format_sharks_gals(file_path, cols = ['ra', 'dec', 'id_galaxy_sky',
 
     # Find Luminosity for each galaxy
     M_sun = 4.51
-    gals['L'] = 10**(-0.4 * (gals['total_ab_dust_Z_VISTA']))
+    gals['L'] = 10**(-0.4 * (gals['total_ab_dust_Z_VISTA']-M_sun))
 
     # Now for each group find the total luminosity of the group, and then take the log of that
     gals['group_L'] = gals.groupby('id_fof')['L'].transform('sum')
@@ -146,14 +150,70 @@ def load_and_format_sharks_gals(file_path, cols = ['ra', 'dec', 'id_galaxy_sky',
     # get group properties as well groupby group id fof
     groups = gals.groupby('id_fof')[['ra_bcg', 'dec_bcg', 'zobs_bcg', f'{mag_col}_bcg', 'fof_halo_mass', 'log_fof_halo_mass', 'group_L', 'log_group_L', 'n_group_fof', 'group_stellar_mass', 'log_group_stellar_mass']].first().reset_index()
 
+
+
+    if region == 'deep':
+        # Filter for deep region
+        mask_deep = (gals['ra'] > 339) & (gals['ra'] < 350) & (gals['dec'] > -35) & (gals['dec'] < -30) & (gals['zobs'] < 0.8) & (gals['total_ap_dust_Z_VISTA'] < 21.25)
+        gals = gals[mask_deep].reset_index(drop=True)
+        groups = groups[groups['id_fof'].isin(gals['id_fof'])].reset_index(drop=True)
+
+    if region == 'wide':
+        # Filter for wide region
+        mask_wide_N = (gals['ra'] > 157.25) & (gals['ra'] < 225.0) & (gals['dec'] > -3.95) & (gals['dec'] < 3.95) & (gals['zobs'] < 0.2) & (gals['total_ap_dust_Z_VISTA'] < 21.25)
+        mask_wide_S_a = (gals['ra'] > 330) & (gals['ra'] < 360+51.6) & (gals['dec'] > -35.6) & (gals['dec'] < -27) & (gals['zobs'] < 0.2) & (gals['total_ap_dust_Z_VISTA'] < 21.25)
+        mask_wide_S_b = (gals['ra'] > 0) & (gals['ra'] < 51.6) & (gals['dec'] > -35.6) & (gals['dec'] < -27) & (gals['zobs'] < 0.2) & (gals['total_ap_dust_Z_VISTA'] < 21.25)
+
+        mask_wide = mask_wide_N | mask_wide_S_a | mask_wide_S_b
+        
+        
+        gals = gals[mask_wide].reset_index(drop=True)
+        groups = groups[groups['id_fof'].isin(gals['id_fof'])].reset_index(drop=True)
+
+
+    groups["n_sat"] = (groups["n_group_fof"] - 1).clip(lower=0).astype(int)
+
+    # Count RED SATELLITES (exclude BCG/central)
+    red_sat_counts = (
+        gals.loc[(gals["id_fof"] != -1) & (~gals["is_bcg"]) & (gals["is_red"])]
+        .groupby("id_fof")
+        .size()
+    )
+
+    groups["n_sat_red"] = red_sat_counts.reindex(groups.index).fillna(0).astype(int)
+
+    # Blue satellites = total sats - red sats (clip for safety)
+    groups["n_sat_blue"] = (groups["n_sat"] - groups["n_sat_red"]).clip(lower=0).astype(int)
+
+    # If you want explicit zeroing when n_sat==0 (already true, but fine)
+    m0 = groups["n_sat"] == 0
+    groups.loc[m0, ["n_sat_red", "n_sat_blue"]] = 0
+
+    # --------------------------
+    # BCG colour flags
+    # --------------------------
+    bcg_is_red = (
+        gals.loc[(gals["id_fof"] != -1) & (gals["is_bcg"])]
+        .groupby("id_fof")["is_red"]
+        .first()
+    )
+
+    groups["is_red_bcg"] = bcg_is_red.reindex(groups.index)
+
+    # For ungrouped (id_fof == -1): there can be MANY galaxies.
+    # If groups contains a single row with id_fof == -1, pick a representative:
+    if (-1 in groups.index):
+        ungrouped = gals.loc[gals["id_fof"] == -1, "is_red"]
+        groups.loc[-1, "is_red_bcg"] = bool(ungrouped.iloc[0]) if len(ungrouped) else False
+
+    # Fill missing BCG flags (e.g. groups with no identified BCG) as False (choose what you prefer)
+    groups["is_red_bcg"] = groups["is_red_bcg"].fillna(False).astype(bool)
+    groups["is_blue_bcg"] = ~groups["is_red_bcg"]
+
+
+
+
     return gals, groups
 
 
-def load_and_format_sharks_groups(file_path, cols = None):
-    
-    if cols is None:
-        groups = pd.read_parquet(file_path)
-    else:
-        groups = pd.read_parquet(file_path, columns = cols)
 
-    return groups
