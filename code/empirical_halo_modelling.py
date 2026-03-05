@@ -401,6 +401,46 @@ def compute_mass_bin_moments_observed_space(
     return centres, out
 
 
+def rebuild_group_colour_occupancy_from_gals(
+    groups: pd.DataFrame,
+    gals: pd.DataFrame,
+    group_id_col: str = "id_fof",
+    gal_red_col: str = "is_red",
+    gal_bcg_col: str = "is_bcg",
+) -> pd.DataFrame:
+    """
+    Rebuild group-level colour occupancy directly from galaxy rows.
+
+    This avoids relying on precomputed group colour columns that may be
+    misaligned after index operations.
+    """
+    needed = {group_id_col, gal_red_col, gal_bcg_col}
+    missing = [c for c in needed if c not in gals.columns]
+    if missing:
+        raise ValueError(f"Cannot rebuild group occupancy; missing galaxy columns: {missing}")
+    if group_id_col not in groups.columns:
+        raise ValueError(f"Cannot rebuild group occupancy; groups missing '{group_id_col}'.")
+
+    g = groups.copy()
+    d = gals[[group_id_col, gal_red_col, gal_bcg_col]].copy()
+    d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=[group_id_col])
+    d[gal_red_col] = d[gal_red_col].astype(bool)
+    d[gal_bcg_col] = d[gal_bcg_col].astype(bool)
+
+    sats = d.loc[~d[gal_bcg_col]]
+    sat_red = sats.loc[sats[gal_red_col]].groupby(group_id_col).size()
+    sat_blue = sats.loc[~sats[gal_red_col]].groupby(group_id_col).size()
+
+    bcg = d.loc[d[gal_bcg_col]].sort_values(group_id_col).groupby(group_id_col, as_index=True)[gal_red_col].first()
+
+    gid = g[group_id_col]
+    g["n_sat_red"] = gid.map(sat_red).fillna(0).astype(int)
+    g["n_sat_blue"] = gid.map(sat_blue).fillna(0).astype(int)
+    g["is_red_bcg"] = gid.map(bcg).fillna(False).astype(bool)
+    g["is_blue_bcg"] = ~g["is_red_bcg"]
+    return g
+
+
 def compute_r200_c_per_mass_bin_from_groups(
     groups: pd.DataFrame,
     mass_col: str,
@@ -619,6 +659,9 @@ def run_from_groups_observed_space(
     # --- column names (galaxies) ---
     gal_z_col:   str = "zobs",     # redshift column in gals
     gal_red_col: str = "is_red",   # boolean/int red-galaxy flag in gals
+    gal_bcg_col: str = "is_bcg",   # boolean/int central flag in gals
+    group_id_col: str = "id_fof",  # group id in both groups and gals
+    rebuild_group_colours_from_gals: bool = True,
     # --- survey geometry ---
     sky_fraction: float = 0.0012,
     z_cutoff:     float = 0.8,
@@ -653,6 +696,8 @@ def run_from_groups_observed_space(
     groups       : group/halo catalog (one row per group)
     gals         : galaxy-level catalog — used only for the n(z) fit;
                    must contain `gal_z_col` and `gal_red_col`
+                   if `rebuild_group_colours_from_gals=True` (default),
+                   it must also contain `group_id_col` and `gal_bcg_col`
     sky_fraction : fraction of sky covered by the survey (default 0.0012)
     z_cutoff     : hard redshift upper limit of the survey (default 0.8)
 
@@ -676,6 +721,15 @@ def run_from_groups_observed_space(
         nz_blue   – callable n(z) for blue galaxies (for diagnostic plots)
     """
     rng = np.random.default_rng(seed)
+
+    if rebuild_group_colours_from_gals:
+        groups = rebuild_group_colour_occupancy_from_gals(
+            groups,
+            gals,
+            group_id_col=group_id_col,
+            gal_red_col=gal_red_col,
+            gal_bcg_col=gal_bcg_col,
+        )
 
     # Separation grids
     if r_bins is None:
